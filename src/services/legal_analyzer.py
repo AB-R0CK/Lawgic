@@ -1,177 +1,623 @@
-import logging
+from __future__ import annotations
+
 import re
-from functools import lru_cache
+from typing import Any
 
-from huggingface_hub import snapshot_download
-from transformers import pipeline
-
-from src.core.config import get_settings
 from src.models.schemas import ClauseAnalysis
-from src.utils.hf_paths import has_hf_weights, resolve_hf_model_path
+from src.core.config import get_settings
 
-logger = logging.getLogger(__name__)
 
-LEGAL_LABELS = [
-    "payment",
-    "penalty",
-    "termination",
-    "liability",
-    "confidentiality",
-    "renewal",
-    "governing_law",
-    "dispute_resolution",
-    "intellectual_property",
-    "warranty",
-]
-
-KEYWORD_MAP = {
-    "payment": ["payment", "fees", "invoice", "consideration", "charge"],
-    "penalty": ["penalty", "fine", "liquidated damages", "default"],
-    "termination": ["termination", "terminate", "breach", "notice period"],
-    "liability": ["liability", "indemnify", "damages", "hold harmless", "unlimited"],
-    "confidentiality": ["confidential", "non-disclosure", "nda", "proprietary"],
-    "renewal": ["renewal", "auto-renew", "automatic renewal", "extend term"],
-    "governing_law": ["governing law", "jurisdiction", "india", "arbitration act"],
-    "dispute_resolution": ["arbitration", "dispute", "conciliation", "tribunal"],
-    "intellectual_property": ["intellectual property", "copyright", "trademark", "patent"],
-    "warranty": ["warranty", "representation", "fitness", "merchantability"],
-}
-
+# ============================================================
+# Entity extraction
+# ============================================================
 
 def _extract_entities(clause_text: str) -> list[dict]:
-    entities = []
-    amounts = re.findall(r"(?:INR|Rs\.?)\s?[\d,]+(?:\.\d+)?", clause_text, flags=re.IGNORECASE)
-    dates = re.findall(
-        r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b",
-        clause_text,
-        flags=re.IGNORECASE,
-    )
-    for amount in amounts:
-        entities.append({"type": "amount", "value": amount})
-    for date in dates:
-        entities.append({"type": "date", "value": date})
-    return entities
+    """
+    Extract basic legal entities from a clause.
 
+    This intentionally uses lightweight pattern matching so that
+    document analysis can work even when the optional legal model
+    is unavailable.
+    """
+
+    entities: list[dict] = []
+
+    if not clause_text:
+        return entities
+
+    # --------------------------------------------------------
+    # Dates
+    # --------------------------------------------------------
+
+    date_patterns = [
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{1,2}\s+"
+        r"(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)"
+        r"\s+\d{4}\b",
+        r"\b(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)"
+        r"\s+\d{1,2},?\s+\d{4}\b",
+    ]
+
+    for pattern in date_patterns:
+        for match in re.finditer(
+            pattern,
+            clause_text,
+            re.IGNORECASE,
+        ):
+            entities.append(
+                {
+                    "text": match.group(0),
+                    "label": "DATE",
+                }
+            )
+
+    # --------------------------------------------------------
+    # Money
+    # --------------------------------------------------------
+
+    money_pattern = (
+        r"(?:₹|Rs\.?|INR|USD|\$|€|£)\s*"
+        r"[\d,]+(?:\.\d+)?"
+        r"(?:\s*(?:crore|lakh|million|billion))?"
+    )
+
+    for match in re.finditer(
+        money_pattern,
+        clause_text,
+        re.IGNORECASE,
+    ):
+        entities.append(
+            {
+                "text": match.group(0),
+                "label": "MONEY",
+            }
+        )
+
+    # --------------------------------------------------------
+    # Percentages
+    # --------------------------------------------------------
+
+    percentage_pattern = r"\b\d+(?:\.\d+)?\s*%"
+
+    for match in re.finditer(
+        percentage_pattern,
+        clause_text,
+    ):
+        entities.append(
+            {
+                "text": match.group(0),
+                "label": "PERCENT",
+            }
+        )
+
+    # --------------------------------------------------------
+    # Durations
+    # --------------------------------------------------------
+
+    duration_pattern = (
+        r"\b\d+(?:\.\d+)?\s+"
+        r"(?:days?|weeks?|months?|years?)\b"
+    )
+
+    for match in re.finditer(
+        duration_pattern,
+        clause_text,
+        re.IGNORECASE,
+    ):
+        entities.append(
+            {
+                "text": match.group(0),
+                "label": "DURATION",
+            }
+        )
+
+    # --------------------------------------------------------
+    # Legal acts / statutes
+    # --------------------------------------------------------
+
+    act_pattern = (
+        r"\b(?:Indian Penal Code|IPC|"
+        r"Code of Criminal Procedure|CrPC|"
+        r"Code of Civil Procedure|CPC|"
+        r"Indian Contract Act|"
+        r"Companies Act|"
+        r"Information Technology Act|"
+        r"Arbitration and Conciliation Act|"
+        r"Consumer Protection Act|"
+        r"Transfer of Property Act|"
+        r"Negotiable Instruments Act|"
+        r"Constitution of India)\b"
+    )
+
+    for match in re.finditer(
+        act_pattern,
+        clause_text,
+        re.IGNORECASE,
+    ):
+        entities.append(
+            {
+                "text": match.group(0),
+                "label": "LAW",
+            }
+        )
+
+    # --------------------------------------------------------
+    # Sections
+    # --------------------------------------------------------
+
+    section_pattern = (
+        r"\bsection\s+"
+        r"\d+[A-Za-z]?"
+        r"(?:\(\d+\))?"
+        r"(?:\([a-z]\))?"
+    )
+
+    for match in re.finditer(
+        section_pattern,
+        clause_text,
+        re.IGNORECASE,
+    ):
+        entities.append(
+            {
+                "text": match.group(0),
+                "label": "SECTION",
+            }
+        )
+
+    # --------------------------------------------------------
+    # Remove duplicate entities
+    # --------------------------------------------------------
+
+    unique_entities: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for entity in entities:
+        key = (
+            entity["text"].lower(),
+            entity["label"],
+        )
+
+        if key not in seen:
+            seen.add(key)
+            unique_entities.append(entity)
+
+    return unique_entities
+
+
+# ============================================================
+# Legal clause classifier
+# ============================================================
 
 class LegalClauseAnalyzer:
+    """
+    Performs legal clause classification.
+
+    The class name is intentionally kept compatible with the
+    existing Lawgic project.
+    """
+
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._classifier = self._load_classifier()
 
-    def _load_classifier(self):
-        primary_source = self.settings.legal_model_local_path or self.settings.legal_model_name
-        resolved_model_path = resolve_hf_model_path(primary_source)
+        self.model = None
+        self.tokenizer = None
 
-        if not has_hf_weights(resolved_model_path):
-            logger.warning(
-                "CustomInLawBERT weights not found at '%s'. Attempting download for '%s'.",
-                resolved_model_path,
-                self.settings.legal_model_name,
-            )
-            try:
-                downloaded_path = snapshot_download(repo_id=self.settings.legal_model_name)
-                resolved_model_path = resolve_hf_model_path(downloaded_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("CustomInLawBERT download failed: %s", exc)
+        # Skip ML model loading for faster document processing
+        # Rule-based classifier will be used instead
+        print("[Lawgic] Using rule-based legal classification (fast mode)")
 
-        if not has_hf_weights(resolved_model_path):
-            logger.warning(
-                "CustomInLawBERT has no usable weights at '%s'. Falling back to rule-based classification.",
-                resolved_model_path,
-            )
-            return None
+    # --------------------------------------------------------
+    # Optional ML model
+    # --------------------------------------------------------
+
+    def _load_classifier(self) -> None:
+        """
+        Try to load the configured legal model.
+
+        The application does not fail if the model cannot be
+        loaded. In that case, the rule-based classifier below
+        is used.
+        """
 
         try:
-            logger.info("Loading legal model from: %s", resolved_model_path)
-            return pipeline(
-                "text-classification",
-                model=resolved_model_path,
-                tokenizer=resolved_model_path,
-                truncation=True,
-                max_length=self.settings.max_clause_tokens,
+            from transformers import (
+                AutoModelForSequenceClassification,
+                AutoTokenizer,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not load CustomInLawBERT, using rule-based classification: %s", exc)
-            return None
+
+            model_name = (
+                self.settings.legal_model_local_path
+                or self.settings.legal_model_name
+            )
+
+            self.tokenizer = (
+                AutoTokenizer.from_pretrained(
+                    model_name
+                )
+            )
+
+            self.model = (
+                AutoModelForSequenceClassification
+                .from_pretrained(
+                    model_name
+                )
+            )
+
+            self.model.eval()
+
+        except Exception as exc:
+            print(
+                "[Lawgic] Legal model could not be loaded. "
+                f"Using rule-based classification. Reason: {exc}"
+            )
+
+            self.model = None
+            self.tokenizer = None
+
+    # --------------------------------------------------------
+    # Rule-based classifier
+    # --------------------------------------------------------
 
     @staticmethod
-    def _heuristic_label(clause_text: str) -> tuple[str, float]:
+    def _heuristic_label(
+        clause_text: str,
+    ) -> tuple[str, float]:
+        """
+        Classify a legal clause using keywords.
+        """
+
         text = clause_text.lower()
-        scores = {}
-        for label, words in KEYWORD_MAP.items():
-            scores[label] = sum(1 for w in words if w in text)
-        best_label = max(scores, key=scores.get)
-        best_score = scores[best_label]
+
+        categories: dict[str, list[str]] = {
+            "Confidentiality": [
+                "confidential",
+                "confidentiality",
+                "non-disclosure",
+                "nondisclosure",
+                "secret information",
+                "proprietary information",
+            ],
+
+            "Termination": [
+                "termination",
+                "terminate",
+                "terminated",
+                "termination for cause",
+                "termination for convenience",
+            ],
+
+            "Payment": [
+                "payment",
+                "payable",
+                "invoice",
+                "fee",
+                "fees",
+                "salary",
+                "compensation",
+                "consideration",
+                "rent",
+            ],
+
+            "Liability": [
+                "liability",
+                "liable",
+                "limitation of liability",
+                "loss or damage",
+                "damages",
+            ],
+
+            "Indemnity": [
+                "indemnify",
+                "indemnification",
+                "indemnity",
+            ],
+
+            "Intellectual Property": [
+                "intellectual property",
+                "copyright",
+                "trademark",
+                "patent",
+                "ownership",
+                "proprietary rights",
+            ],
+
+            "Dispute Resolution": [
+                "dispute",
+                "disputes",
+                "dispute resolution",
+                "arbitration",
+                "mediation",
+            ],
+
+            "Governing Law": [
+                "governing law",
+                "governed by the laws",
+                "laws of",
+                "jurisdiction",
+            ],
+
+            "Force Majeure": [
+                "force majeure",
+                "act of god",
+                "natural disaster",
+                "earthquake",
+                "flood",
+                "war",
+            ],
+
+            "Warranty": [
+                "warranty",
+                "warranties",
+                "warrants",
+                "representation",
+                "representations",
+            ],
+
+            "Privacy / Data Protection": [
+                "personal data",
+                "personal information",
+                "data protection",
+                "privacy",
+                "data processing",
+                "sensitive information",
+            ],
+
+            "Non-Compete": [
+                "non-compete",
+                "non compete",
+                "competition",
+                "compete",
+            ],
+
+            "Non-Solicitation": [
+                "non-solicitation",
+                "non solicitation",
+                "solicit",
+                "solicitation",
+            ],
+
+            "Notice": [
+                "notice",
+                "written notice",
+                "notice period",
+            ],
+
+            "Renewal": [
+                "renewal",
+                "renew",
+                "automatically renew",
+            ],
+
+            "Compliance": [
+                "compliance",
+                "comply with",
+                "applicable law",
+                "applicable laws",
+                "regulatory",
+            ],
+
+            "Definitions": [
+                "means",
+                "shall mean",
+                "definition",
+                "defined as",
+            ],
+        }
+
+        best_label = "General Legal Clause"
+        best_score = 0
+
+        for label, keywords in categories.items():
+            score = 0
+
+            for keyword in keywords:
+                if keyword in text:
+                    score += 1
+
+            if score > best_score:
+                best_score = score
+                best_label = label
+
         if best_score == 0:
-            return "other", 0.3
-        confidence = min(0.55 + best_score * 0.1, 0.95)
+            confidence = 0.40
+        elif best_score == 1:
+            confidence = 0.65
+        elif best_score == 2:
+            confidence = 0.80
+        else:
+            confidence = 0.90
+
         return best_label, confidence
 
-    def _predict(self, clause_text: str) -> tuple[str, float]:
-        if self._classifier is None:
-            return self._heuristic_label(clause_text)
+    # --------------------------------------------------------
+    # ML prediction
+    # --------------------------------------------------------
+
+    def _predict_with_model(
+        self,
+        clause_text: str,
+    ) -> tuple[str, float] | None:
+        """
+        Attempt prediction with the configured transformer model.
+
+        If the model does not provide usable label mappings,
+        return None and let the heuristic classifier handle it.
+        """
+
+        if (
+            self.model is None
+            or self.tokenizer is None
+        ):
+            return None
 
         try:
-            prediction = self._classifier(clause_text, top_k=1)[0]
-            label = str(prediction.get("label", "other")).lower()
-            score = float(prediction.get("score", 0.0))
-            if label.startswith("label_"):
-                idx = int(label.replace("label_", ""))
-                label = LEGAL_LABELS[idx] if idx < len(LEGAL_LABELS) else "other"
-            return label, score
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Model inference failed, using heuristic classifier: %s", exc)
-            return self._heuristic_label(clause_text)
+            import torch
 
-    def analyze_clauses(self, clauses: list[str]) -> list[ClauseAnalysis]:
-        if not clauses:
-            return []
+            inputs = self.tokenizer(
+                clause_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
 
-        analyses: list[ClauseAnalysis] = []
-        if self._classifier is not None:
-            try:
-                predictions = self._classifier(
-                    clauses,
-                    top_k=1,
-                    batch_size=16,
-                    truncation=True,
-                    max_length=self.settings.max_clause_tokens,
+            with torch.no_grad():
+                outputs = self.model(
+                    **inputs
                 )
-                for idx, clause in enumerate(clauses, start=1):
-                    prediction = predictions[idx - 1][0] if isinstance(predictions[idx - 1], list) else predictions[idx - 1]
-                    label = str(prediction.get("label", "other")).lower()
-                    score = float(prediction.get("score", 0.0))
-                    if label.startswith("label_"):
-                        label_idx = int(label.replace("label_", ""))
-                        label = LEGAL_LABELS[label_idx] if label_idx < len(LEGAL_LABELS) else "other"
 
-                    analyses.append(
-                        ClauseAnalysis(
-                            clause_id=idx,
-                            clause_text=clause,
-                            clause_type=label,
-                            confidence=score,
-                            entities=_extract_entities(clause),
-                        )
-                    )
-                return analyses
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Batch model inference failed, falling back to per-clause mode: %s", exc)
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=-1,
+            )
 
-        for idx, clause in enumerate(clauses, start=1):
-            label, confidence = self._predict(clause)
-            analyses.append(
-                ClauseAnalysis(
-                    clause_id=idx,
-                    clause_text=clause,
-                    clause_type=label,
-                    confidence=confidence,
-                    entities=_extract_entities(clause),
+            confidence, index = torch.max(
+                probabilities,
+                dim=-1,
+            )
+
+            label_index = int(
+                index.item()
+            )
+
+            confidence_value = float(
+                confidence.item()
+            )
+
+            id2label = getattr(
+                self.model.config,
+                "id2label",
+                {},
+            )
+
+            label = id2label.get(
+                label_index,
+                f"LABEL_{label_index}",
+            )
+
+            return (
+                str(label),
+                confidence_value,
+            )
+
+        except Exception as exc:
+            print(
+                "[Lawgic] Legal model prediction failed: "
+                f"{exc}"
+            )
+
+            return None
+
+    # --------------------------------------------------------
+    # Single clause analysis
+    # --------------------------------------------------------
+
+    def analyze_single_clause(
+        self,
+        clause_text: str,
+    ) -> ClauseAnalysis:
+        """
+        Analyze one clause.
+        """
+
+        label_and_confidence = (
+            self._predict_with_model(
+                clause_text
+            )
+        )
+
+        if label_and_confidence is None:
+            label_and_confidence = (
+                self._heuristic_label(
+                    clause_text
                 )
             )
-        return analyses
+
+        label, confidence = (
+            label_and_confidence
+        )
+
+        entities = _extract_entities(
+            clause_text
+        )
+
+        return ClauseAnalysis(
+            clause_id=0,
+            clause_text=clause_text,
+            clause_type=label,
+            entities=entities,
+            confidence=confidence,
+        )
+
+    # --------------------------------------------------------
+    # Analyze all clauses
+    # --------------------------------------------------------
+
+    def analyze_clauses(
+        self,
+        clauses: list[str],
+    ) -> list[ClauseAnalysis]:
+        """
+        Analyze a list of clauses.
+        """
+
+        results: list[ClauseAnalysis] = []
+
+        for index, clause_text in enumerate(
+            clauses,
+            start=1,
+        ):
+            if not clause_text:
+                continue
+
+            clause_text = str(
+                clause_text
+            ).strip()
+
+            if not clause_text:
+                continue
+
+            result = self.analyze_single_clause(
+                clause_text
+            )
+
+            result.clause_id = index
+
+            results.append(
+                result
+            )
+
+        return results
 
 
-@lru_cache(maxsize=1)
+# ============================================================
+# Backward-compatible alias
+# ============================================================
+
+# Your new LegalAssistantService expects LegalAnalyzer.
+# Your existing project uses LegalClauseAnalyzer.
+#
+# Both names now refer to the same implementation.
+
+LegalAnalyzer = LegalClauseAnalyzer
+
+
+# ============================================================
+# Singleton
+# ============================================================
+
+_legal_analyzer: LegalClauseAnalyzer | None = None
+
+
 def get_legal_analyzer() -> LegalClauseAnalyzer:
-    return LegalClauseAnalyzer()
+    """
+    Return the shared legal analyzer instance.
+    """
+
+    global _legal_analyzer
+
+    if _legal_analyzer is None:
+        _legal_analyzer = LegalClauseAnalyzer()
+
+    return _legal_analyzer

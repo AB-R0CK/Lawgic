@@ -1,8 +1,8 @@
+version: "3.9"
+
 services:
   backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
+    image: mitdocker30/legal-backend:latest
     container_name: legal-backend
     env_file:
       - .env
@@ -17,14 +17,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./:/app
+      - ./src:/app/src
       - hf_cache:/app/.cache/huggingface
     restart: unless-stopped
 
   frontend:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
+    image: mitdocker30/legal-frontend:latest
     container_name: legal-frontend
     depends_on:
       - backend
@@ -37,7 +35,6 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./:/app
       - chat_db:/app/misc
     restart: unless-stopped
 

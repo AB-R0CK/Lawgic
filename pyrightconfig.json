@@ -1,0 +1,21 @@
+{
+    "include": [
+        "src",
+        "backend"
+    ],
+
+    "exclude": [
+        ".venv",
+        "frontend-react/node_modules",
+        "**/__pycache__"
+    ],
+
+    "executionEnvironments": [
+        {
+            "root": ".",
+            "extraPaths": [
+                "."
+            ]
+        }
+    ]
+}

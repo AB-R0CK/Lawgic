@@ -12,54 +12,112 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from src.core.config import get_settings
 
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 STATE_TTL_SECONDS = 600
+
 _oauth_state_store: dict[str, dict] = {}
 
 
 def _append_query_param(url: str, key: str, value: str) -> str:
+    """
+    Add or replace a query parameter in a URL.
+    """
     parsed = urlparse(url)
     query = dict(parse_qsl(parsed.query))
     query[key] = value
-    return urlunparse(parsed._replace(query=urlencode(query)))
+
+    return urlunparse(
+        parsed._replace(
+            query=urlencode(query)
+        )
+    )
 
 
 @lru_cache(maxsize=1)
 def _token_serializer() -> URLSafeTimedSerializer:
+    """
+    Creates the serializer used for our application auth token.
+    """
     settings = get_settings()
-    return URLSafeTimedSerializer(settings.auth_secret_key, salt="legal-assistant-auth")
+
+    return URLSafeTimedSerializer(
+        settings.auth_secret,
+        salt="legal-assistant-auth",
+    )
 
 
 def _cleanup_oauth_states() -> None:
+    """
+    Remove expired OAuth states from memory.
+    """
     now = time.time()
-    stale = [k for k, v in _oauth_state_store.items() if v.get("exp", 0) < now]
+
+    stale = [
+        key
+        for key, value in _oauth_state_store.items()
+        if value.get("exp", 0) < now
+    ]
+
     for key in stale:
         _oauth_state_store.pop(key, None)
 
 
-def _extract_bearer_token(authorization: str | None) -> str | None:
+def _extract_bearer_token(
+    authorization: str | None,
+) -> str | None:
+    """
+    Extract Bearer token from Authorization header.
+    """
+
     if not authorization:
         return None
+
     parts = authorization.split(" ", 1)
+
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1].strip()
+
     return None
 
 
+# ============================================================
+# GOOGLE LOGIN
+# ============================================================
+
 @router.get("/google/login")
-def google_login(next_url: str | None = Query(default=None, alias="next")) -> RedirectResponse:
+def google_login(
+    next_url: str | None = Query(
+        default=None,
+        alias="next",
+    )
+) -> RedirectResponse:
+
     settings = get_settings()
-    if not settings.google_client_id or not settings.google_client_secret or not settings.google_redirect_uri:
-        raise HTTPException(status_code=500, detail="Google OAuth is not configured.")
+
+    # Check Google OAuth configuration
+    if (
+        not settings.google_client_id
+        or not settings.google_client_secret
+        or not settings.google_redirect_uri
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth is not configured.",
+        )
 
     _cleanup_oauth_states()
+
+    # Generate secure OAuth state
     state = secrets.token_urlsafe(24)
+
     _oauth_state_store[state] = {
         "exp": time.time() + STATE_TTL_SECONDS,
         "next": next_url or settings.frontend_base_url,
     }
 
+    # Google OAuth parameters
     params = {
         "client_id": settings.google_client_id,
         "redirect_uri": settings.google_redirect_uri,
@@ -70,27 +128,137 @@ def google_login(next_url: str | None = Query(default=None, alias="next")) -> Re
         "state": state,
         "prompt": "select_account",
     }
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        + urlencode(params)
+    )
+
+    print("========== GOOGLE LOGIN ==========")
+    print("Google Client ID configured:", bool(settings.google_client_id))
+    print("Google Redirect URI:", settings.google_redirect_uri)
+    print("Frontend URL:", settings.frontend_base_url)
+    print("==================================")
+
     return RedirectResponse(auth_url)
 
 
+# ============================================================
+# GOOGLE CALLBACK
+# ============================================================
+
 @router.get("/google/callback")
-def google_callback(code: str | None = None, state: str | None = None, error: str | None = None) -> RedirectResponse:
+def google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+
     settings = get_settings()
+
     redirect_base = settings.frontend_base_url
 
+    # --------------------------------------------------------
+    # Google returned an OAuth error
+    # --------------------------------------------------------
+
     if error:
-        return RedirectResponse(_append_query_param(redirect_base, "auth_error", error))
+        print("========== GOOGLE CALLBACK ERROR ==========")
+        print("Google OAuth error:", error)
+        print("===========================================")
+
+        return RedirectResponse(
+            _append_query_param(
+                redirect_base,
+                "auth_error",
+                error,
+            )
+        )
+
+    # --------------------------------------------------------
+    # Missing code or state
+    # --------------------------------------------------------
+
     if not code or not state:
-        return RedirectResponse(_append_query_param(redirect_base, "auth_error", "missing_code_or_state"))
+
+        print("GOOGLE CALLBACK ERROR: Missing code or state")
+
+        return RedirectResponse(
+            _append_query_param(
+                redirect_base,
+                "auth_error",
+                "missing_code_or_state",
+            )
+        )
+
+    # --------------------------------------------------------
+    # Validate OAuth state
+    # --------------------------------------------------------
 
     state_data = _oauth_state_store.pop(state, None)
-    if not state_data or state_data.get("exp", 0) < time.time():
-        return RedirectResponse(_append_query_param(redirect_base, "auth_error", "invalid_state"))
+
+    if (
+        not state_data
+        or state_data.get("exp", 0) < time.time()
+    ):
+
+        print("GOOGLE CALLBACK ERROR: Invalid or expired state")
+
+        return RedirectResponse(
+            _append_query_param(
+                redirect_base,
+                "auth_error",
+                "invalid_state",
+            )
+        )
 
     next_url = state_data.get("next") or redirect_base
 
+    # ========================================================
+    # GOOGLE TOKEN EXCHANGE
+    # ========================================================
+
     try:
+
+        print()
+        print("============================================")
+        print("      GOOGLE TOKEN EXCHANGE STARTED")
+        print("============================================")
+
+        print(
+            "Google Client ID configured:",
+            bool(settings.google_client_id)
+        )
+
+        print(
+            "Google Client Secret configured:",
+            bool(settings.google_client_secret)
+        )
+
+        print(
+            "Google Redirect URI:",
+            settings.google_redirect_uri
+        )
+
+        print(
+            "Frontend URL:",
+            settings.frontend_base_url
+        )
+
+        print(
+            "Authorization code received:",
+            bool(code)
+        )
+
+        print(
+            "State received:",
+            bool(state)
+        )
+
+        # ----------------------------------------------------
+        # Exchange authorization code for Google tokens
+        # ----------------------------------------------------
+
         token_resp = requests.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -102,43 +270,279 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
             },
             timeout=30,
         )
-        token_resp.raise_for_status()
-        token_data = token_resp.json()
-        raw_id_token = token_data.get("id_token")
-        if not raw_id_token:
-            return RedirectResponse(_append_query_param(next_url, "auth_error", "missing_id_token"))
 
-        id_info = google_id_token.verify_oauth2_token(
-            raw_id_token,
-            google_requests.Request(),
-            settings.google_client_id,
-        )
+        # ----------------------------------------------------
+        # PRINT REAL GOOGLE RESPONSE
+        # ----------------------------------------------------
+
+        print()
+        print("========== GOOGLE TOKEN RESPONSE ==========")
+        print("HTTP STATUS:", token_resp.status_code)
+        print("RESPONSE BODY:", token_resp.text)
+        print("REDIRECT URI USED:", settings.google_redirect_uri)
+        print("===========================================")
+
+        # ----------------------------------------------------
+        # Handle Google token request failure
+        # ----------------------------------------------------
+
+        if not token_resp.ok:
+
+            print()
+            print("❌ GOOGLE TOKEN EXCHANGE FAILED")
+            print("HTTP STATUS:", token_resp.status_code)
+            print("GOOGLE RESPONSE:", token_resp.text)
+            print()
+
+            return RedirectResponse(
+                _append_query_param(
+                    next_url,
+                    "auth_error",
+                    "google_token_exchange_failed",
+                )
+            )
+
+        # ----------------------------------------------------
+        # Parse token response
+        # ----------------------------------------------------
+
+        try:
+            token_data = token_resp.json()
+
+        except ValueError as exc:
+
+            print("❌ GOOGLE RESPONSE IS NOT VALID JSON")
+            print("Response:", token_resp.text)
+
+            raise RuntimeError(
+                "Google returned an invalid JSON response."
+            ) from exc
+
+        print("Google token response parsed successfully.")
+
+        # ----------------------------------------------------
+        # Get ID token
+        # ----------------------------------------------------
+
+        raw_id_token = token_data.get("id_token")
+
+        if not raw_id_token:
+
+            print("❌ GOOGLE DID NOT RETURN AN ID TOKEN")
+            print("Token data:", token_data)
+
+            return RedirectResponse(
+                _append_query_param(
+                    next_url,
+                    "auth_error",
+                    "missing_id_token",
+                )
+            )
+
+        print("Google ID token received successfully.")
+
+        # ====================================================
+        # VERIFY GOOGLE ID TOKEN
+        # ====================================================
+
+        try:
+
+            id_info = google_id_token.verify_oauth2_token(
+                raw_id_token,
+                google_requests.Request(),
+                settings.google_client_id,
+            )
+
+        except Exception as exc:
+
+            print()
+            print("❌ GOOGLE ID TOKEN VERIFICATION FAILED")
+            print("ERROR TYPE:", type(exc).__name__)
+            print("ERROR:", repr(exc))
+            print()
+
+            return RedirectResponse(
+                _append_query_param(
+                    next_url,
+                    "auth_error",
+                    "google_id_token_verification_failed",
+                )
+            )
+
+        # ====================================================
+        # EXTRACT USER INFORMATION
+        # ====================================================
+
         user_payload = {
             "id": id_info.get("sub", ""),
             "email": id_info.get("email", ""),
             "name": id_info.get("name", "User"),
             "picture": id_info.get("picture", ""),
         }
-        token = _token_serializer().dumps(user_payload)
-        redirect_url = _append_query_param(next_url, "auth_token", token)
-        return RedirectResponse(redirect_url)
-    except Exception:
-        return RedirectResponse(_append_query_param(next_url, "auth_error", "google_exchange_failed"))
 
+        print()
+        print("========== GOOGLE USER ==========")
+        print("User ID received:", bool(user_payload["id"]))
+        print("Email received:", bool(user_payload["email"]))
+        print("Name:", user_payload["name"])
+        print("=================================")
+
+        # ----------------------------------------------------
+        # Validate user ID
+        # ----------------------------------------------------
+
+        if not user_payload["id"]:
+
+            print("❌ Google user ID is missing.")
+
+            return RedirectResponse(
+                _append_query_param(
+                    next_url,
+                    "auth_error",
+                    "missing_google_user_id",
+                )
+            )
+
+        # ====================================================
+        # CREATE OUR APPLICATION TOKEN
+        # ====================================================
+
+        token = _token_serializer().dumps(
+            user_payload
+        )
+
+        # ----------------------------------------------------
+        # Redirect to frontend
+        # ----------------------------------------------------
+
+        redirect_url = _append_query_param(
+            next_url,
+            "auth_token",
+            token,
+        )
+
+        redirect_url = _append_query_param(
+            redirect_url,
+            "name",
+            user_payload.get("name", "User"),
+        )
+
+        print()
+        print("============================================")
+        print("✅ GOOGLE LOGIN SUCCESSFUL")
+        print("Redirecting to:", next_url)
+        print("============================================")
+        print()
+
+        return RedirectResponse(
+            redirect_url
+        )
+
+    # ========================================================
+    # REQUEST EXCEPTION
+    # ========================================================
+
+    except requests.RequestException as exc:
+
+        print()
+        print("❌ GOOGLE REQUEST EXCEPTION")
+        print("ERROR TYPE:", type(exc).__name__)
+        print("ERROR:", repr(exc))
+
+        if exc.response is not None:
+
+            print(
+                "HTTP STATUS:",
+                exc.response.status_code,
+            )
+
+            print(
+                "GOOGLE RESPONSE:",
+                exc.response.text,
+            )
+
+        print()
+
+        return RedirectResponse(
+            _append_query_param(
+                next_url,
+                "auth_error",
+                "google_request_exception",
+            )
+        )
+
+    # ========================================================
+    # UNKNOWN EXCEPTION
+    # ========================================================
+
+    except Exception as exc:
+
+        print()
+        print("❌ GOOGLE OAUTH UNKNOWN ERROR")
+        print("ERROR TYPE:", type(exc).__name__)
+        print("ERROR:", repr(exc))
+        print()
+
+        return RedirectResponse(
+            _append_query_param(
+                next_url,
+                "auth_error",
+                "google_oauth_error",
+            )
+        )
+
+
+# ============================================================
+# CURRENT USER
+# ============================================================
 
 @router.get("/me")
-def auth_me(authorization: str | None = Header(default=None)) -> dict:
+def auth_me(
+    authorization: str | None = Header(default=None),
+) -> dict:
+
     settings = get_settings()
-    token = _extract_bearer_token(authorization)
+
+    token = _extract_bearer_token(
+        authorization
+    )
+
     if not token:
-        raise HTTPException(status_code=401, detail="Missing auth token.")
+
+        raise HTTPException(
+            status_code=401,
+            detail="Missing auth token.",
+        )
 
     try:
-        user = _token_serializer().loads(token, max_age=settings.auth_token_ttl_seconds)
-        if not isinstance(user, dict) or not user.get("id"):
-            raise HTTPException(status_code=401, detail="Invalid auth token.")
+
+        user = _token_serializer().loads(
+            token,
+            max_age=settings.auth_token_ttl_seconds,
+        )
+
+        if (
+            not isinstance(user, dict)
+            or not user.get("id")
+        ):
+
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid auth token.",
+            )
+
         return user
+
     except SignatureExpired as exc:
-        raise HTTPException(status_code=401, detail="Auth token expired.") from exc
+
+        raise HTTPException(
+            status_code=401,
+            detail="Auth token expired.",
+        ) from exc
+
     except (BadSignature, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="Invalid auth token.") from exc
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid auth token.",
+        ) from exc
