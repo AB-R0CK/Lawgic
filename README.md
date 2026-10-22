@@ -35,12 +35,12 @@ This project is a legal-tech assistant prototype and not legal advice.
 - Multi-chat, new chat, delete chat.
 
 ### Frontend ('React')
-Google sign-in.
-Sidebar document upload + analysis trigger.
-Auto document summarization displayed side by side.
-Chat UI with citations and retrieved context.
-Multi-chat, new chat, delete chat.
-Dark and light theme Option,for better user Experience 
+- Google sign-in.
+- Sidebar document upload + analysis trigger.
+- Auto document summarization displayed side by side.
+- Chat UI with citations and retrieved context.
+- Multi-chat, new chat, delete chat.
+- Dark and light theme Option,for better user Experience 
 
 ### Data/State
 - Vector DB: existing persistent Chroma in `vector_db/`.
