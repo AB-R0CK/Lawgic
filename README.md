@@ -34,6 +34,14 @@ This project is a legal-tech assistant prototype and not legal advice.
 - Chat UI with citations and retrieved context.
 - Multi-chat, new chat, delete chat.
 
+### Frontend ('React')
+Google sign-in.
+Sidebar document upload + analysis trigger.
+Auto document summarization displayed side by side.
+Chat UI with citations and retrieved context.
+Multi-chat, new chat, delete chat.
+Dark and light theme Option,for better user Experience 
+
 ### Data/State
 - Vector DB: existing persistent Chroma in `vector_db/`.
 - Local chat persistence: SQLite at `misc/chat_history.db` (or `CHAT_DB_PATH`).
